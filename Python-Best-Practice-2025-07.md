@@ -46,7 +46,7 @@ Pythonで何かを開発する上で、分野を問わず共通する基本的�
     - **1. `pyproject.toml` を直接編集**
     - **2. ロックファイルを再生成**:
       ```bash
-      uv pip compile pyproject.toml -o requirements.lock
+      uv lock
       ```
     - **3. 仮想環境への同期**:
       ```bash
@@ -1619,56 +1619,180 @@ myapp/
 
 - **Dockerfileサンプル (uv + マルチステージビルド)**
 ```dockerfile
-# --- ステージ1: ビルダー ---
-# 依存関係のビルドとインストールを行うステージ
-FROM python:3.11-slim as builder
+# syntax=docker/dockerfile:1
 
-# uvがビルドコンテナ内で仮想環境を作成しようとするのを防ぐ
-ENV UV_NO_VENV 1
+# Build stage
+FROM python:3.13-slim as builder
+
+# Install uv
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3-pip && \
+    pip install --no-cache-dir uv && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Add uv to PATH
+ENV PATH="/root/.local/bin:$PATH"
+
+# Set working directory
 WORKDIR /app
 
-# まず、uv自体をインストールする
-RUN pip install uv
+# Copy project files
+COPY pyproject.toml ./
+COPY README.md ./
+COPY uv.lock ./
 
-# 依存関係定義ファイルとlockファイルをコピー
-COPY pyproject.toml uv.lock ./
+# Copy source code
+COPY src/ ./src/
 
-# uv sync でlockファイルに基づいて依存関係をインストール
-# --frozen-lock は pyproject.toml と uv.lock の不整合を検知する
-RUN uv sync --frozen-lock
+# Install dependencies
+RUN uv sync --frozen
 
-# --- ステージ2: ファイナル ---
-# 実際にアプリケーションを実行する軽量なステージ
-FROM python:3.11-slim
+# Test stage
+FROM builder as test
 
+# Copy test files
+COPY tests/ ./tests/
+
+# Run tests
+RUN uv run pytest tests/ -v
+
+# Development stage for generating lock files
+FROM builder as dev
+
+# This stage can be used to update uv.lock
+CMD ["uv", "lock"]
+
+# Production stage
+FROM python:3.12-slim as production
+
+# Install uv for production
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates && \
+    curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Add uv to PATH
+ENV PATH="/root/.local/bin:$PATH"
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser
+
+# Set working directory
 WORKDIR /app
 
-# セキュリティ向上のため、専用の非rootユーザーを作成・利用
-RUN addgroup --system app && adduser --system --group app
+# Copy lock file and project files from builder
+COPY --from=builder /app/uv.lock ./
+COPY --from=builder /app/pyproject.toml ./
+COPY --from=builder /app/README.md ./
 
-# ビルダーステージからインストール済みの依存関係のみをコピー
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+# Install only production dependencies
+RUN uv sync --frozen --no-dev
 
-# アプリケーションのソースコードをコピー
-COPY . .
+# Copy source code
+COPY --from=builder /app/src/ ./src/
 
-# ファイルの所有権を新しいユーザーに変更
-RUN chown -R app:app /app
+# Change ownership to non-root user
+RUN chown -R appuser:appuser /app
 
-# ユーザーを切り替え
-USER app
+# Switch to non-root user
+USER appuser
 
-# アプリケーションが使用するポートを公開
-EXPOSE 8000
+# Set Python path
+ENV PYTHONPATH=/app
 
-# コンテナ起動時に実行するコマンド (Gunicorn + Uvicornワーカーの例)
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "4", "-b", "0.0.0.0:8000", "your_main_module:app"]
+# Run the application
+CMD ["uv", "run", "python", "-m", "src.main"]
 ```
 - **解説**
 1.  **`uv sync --frozen-lock`**: `uv.lock`ファイルと環境を完全に同期させ、**決定論的ビルド**を実現します。
 2.  **マルチステージビルド**: ビルドに必要なツール（`uv`自体など）が最終イメージに含まれず、イメージが軽量かつセキュアになります。
 3.  **レイヤーキャッシュの活用**: `COPY pyproject.toml uv.lock ./` を `COPY . .` より前に行うことで、依存関係の変更がない限り、`uv sync`のレイヤーはキャッシュが利用され、ビルドが高速になります。
 4.  **非rootユーザーでの実行**: コンテナのセキュリティにおける基本的なプラクティスです（最小権限の原則）。
+
+```yml
+version: '3.8'
+
+services:
+  # Production service
+  app:
+    build:
+      context: .
+      target: production
+    # image: python-app:latest
+    container_name: python-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - app-network
+
+  # Test service
+  test:
+    build:
+      context: .
+      target: test
+    # image: python-app:test
+    container_name: python-app-test
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: uv run pytest tests/ -v
+    networks:
+      - app-network
+
+  # Development service for updating uv.lock
+  dev:
+    build:
+      context: .
+      target: dev
+    # image: python-app:dev
+    container_name: python-app-dev
+    volumes:
+      - ./pyproject.toml:/app/pyproject.toml
+      - ./uv.lock:/app/uv.lock
+      - ./src:/app/src
+      - ./tests:/app/tests
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+```
+
+### `uv.lock` ファイルの作成
+
+```
+docker compose run --rm dev uv lock
+```
+
+### テストの実行
+
+```
+docker compose run --rm test
+```
+
+### アプリケーションの起動
+
+```
+docker compose up app -d
+```
 
 ## 20. インフラストラクチャと実行環境
 
