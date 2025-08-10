@@ -1629,190 +1629,163 @@ myapp/
 ## 19. Containerization (Dockerfile)
 **19. コンテナ化 (Dockerfile)**
 
-プロダクション環境で利用するための、セキュアで効率的な`Dockerfile`を作成します。
+### ベストプラクティス（要点）
 
-- **ゴール**:
-  - **決定論的ビルド**: `uv.lock`を使い、どの環境でも同じ依存関係をインストールする。
-  - **軽量なイメージ**: マルチステージビルドで最終的なイメージサイズを小さく保つ。
-  - **高いセキュリティ**: root権限でのコンテナ実行を避ける。
-  - **ビルド時間の短縮**: Dockerのレイヤーキャッシュを最大限に活用する。
+1. 公式の手順に沿って uv を導入する
 
-- **Dockerfileサンプル (uv + マルチステージビルド)**
-```dockerfile
-# syntax=docker/dockerfile:1
+* もっとも簡単なのは **uv 付きのベースイメージ**を使うか、**uv の公式イメージからバイナリを COPY** する方法。タグは**特定バージョン（できれば digest）でピン留め**して再現性を担保する。 ([Astral Docs][1])
 
-# Build stage
-FROM python:3.13-slim as builder
+2. `.venv` はイメージに持ち込まない
 
-# Install uv
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    python3-pip && \
-    pip install --no-cache-dir uv && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+* **`.dockerignore` に `.venv/` を入れる**。ローカルの仮想環境はプラットフォーム依存なので、**イメージ内で作り直す**。 ([Astral Docs][1])
 
-# Add uv to PATH
-ENV PATH="/root/.local/bin:$PATH"
+3. 依存関係とアプリ本体を**レイヤ分離**してビルド時間短縮
 
-# Set working directory
+* 先に `uv sync --locked --no-install-project` で**依存のみ**を同期 → その後にソースを COPY → 最後に `uv sync --locked`。Docker の**cache mount**を使うとさらに速い。 ([Astral Docs][1])
+
+4. デフォルトの起動は `uv run ...` か PATH で `.venv` を有効化
+
+* `CMD ["uv", "run", "your-entrypoint"]` か、`ENV PATH="/app/.venv/bin:$PATH"` のどちらか。 ([Astral Docs][1])
+
+5. 本番向けは **non-editable install** + **マルチステージ**
+
+* ビルダーで `uv sync --no-editable`（編集不可＝**ソースに依存しない環境**）を作成 → **最終ステージへ仮想環境だけ COPY**。イメージの中にソースを持たせたくない場合にも有効。 ([Astral Docs][1])
+
+6. バイトコードコンパイル・キャッシュ最適化
+
+* 起動を速くするなら `UV_COMPILE_BYTECODE=1` か `uv sync --compile-bytecode`。
+* `--mount=type=cache,target=/root/.cache/uv` を使い、異なる FS でも警告が出ないよう `UV_LINK_MODE=copy` を設定。 ([Astral Docs][1])
+
+7. uv を最終イメージに残さない選択肢
+
+* 必要がなければ **RUN 毎に uv バイナリを一時マウント**するテクニックもある（最終イメージをよりスリムに）。 ([Astral Docs][1])
+
+8. musl/Alpine と ARM の注意
+
+* **Alpine の ARM では uv が Python の自動導入をまだサポートしていない**ため、`apk add python3~=3.12` などで明示的に入れる。 ([Astral Docs][1])
+
+9. システム Python を使うか `.venv` を使うか
+
+* コンテナでは**システム環境にインストール（`UV_SYSTEM_PYTHON=1` or `uv pip --system`）**でも隔離は保たれる。一方で、**`.venv` を切る**なら PATH を通す or `VIRTUAL_ENV` を設定。チームの運用方針で統一する。 ([Astral Docs][1])
+
+10. 開発ループ最適化（docker compose watch）
+
+* 監視設定で **ソースは sync、`.venv` は exclude**、`pyproject.toml` 変化で **rebuild** を掛けると快適。 ([Astral Docs][1])
+
+---
+
+### 参考 Dockerfile（本番向け・pyproject + uv.lock 前提）
+
+```Dockerfile
+# -------- builder: 依存＋アプリを non-editable で同期して .venv を固める --------
+FROM python:3.12-slim-bookworm AS builder
+
+# uv をピン留めして導入（digest 推奨。例では 0.8.7 を使用）
+COPY --from=ghcr.io/astral-sh/uv:0.8.7 /uv /uvx /bin/
+
 WORKDIR /app
 
-# Copy project files
-COPY pyproject.toml ./
-COPY README.md ./
-COPY uv.lock ./
+# ビルド高速化オプション
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
 
-# Copy source code
-COPY src/ ./src/
+# 依存のみを先に同期（キャッシュを効かせる）
+# ※ bind mount で pyproject/uv.lock を直接読み込み、レイヤ汚染を抑える
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=/app/uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=/app/pyproject.toml \
+    uv sync --locked --no-install-project --no-editable
 
-# Install dependencies
-RUN uv sync --frozen
+# アプリ本体を最後にコピー
+ADD . /app
 
-# Test stage
-FROM builder as test
+# アプリも non-editable で同期（.venv 内に固定物として配置）
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-editable
 
-# Copy test files
-COPY tests/ ./tests/
+# -------- runtime: より小さな最終イメージ --------
+FROM python:3.12-slim-bookworm AS runtime
 
-# Run tests
-RUN uv run pytest tests/ -v
-
-# Development stage for generating lock files
-FROM builder as dev
-
-# This stage can be used to update uv.lock
-CMD ["uv", "lock"]
-
-# Production stage
-FROM python:3.12-slim as production
-
-# Install uv for production
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates && \
-    curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Add uv to PATH
-ENV PATH="/root/.local/bin:$PATH"
-
-# Create non-root user
-RUN useradd -m -u 1000 appuser
-
-# Set working directory
-WORKDIR /app
-
-# Copy lock file and project files from builder
-COPY --from=builder /app/uv.lock ./
-COPY --from=builder /app/pyproject.toml ./
-COPY --from=builder /app/README.md ./
-
-# Install only production dependencies
-RUN uv sync --frozen --no-dev
-
-# Copy source code
-COPY --from=builder /app/src/ ./src/
-
-# Change ownership to non-root user
-RUN chown -R appuser:appuser /app
-
-# Switch to non-root user
+# 非 root 実行（セキュリティ＆K8s 互換）
+RUN useradd -m appuser
 USER appuser
 
-# Set Python path
-ENV PYTHONPATH=/app
+WORKDIR /app
 
-# Run the application
-CMD ["uv", "run", "python", "-m", "src.main"]
-```
-- **解説**
-1.  **`uv sync --frozen-lock`**: `uv.lock`ファイルと環境を完全に同期させ、**決定論的ビルド**を実現します。
-2.  **マルチステージビルド**: ビルドに必要なツール（`uv`自体など）が最終イメージに含まれず、イメージが軽量かつセキュアになります。
-3.  **レイヤーキャッシュの活用**: `COPY pyproject.toml uv.lock ./` を `COPY . .` より前に行うことで、依存関係の変更がない限り、`uv sync`のレイヤーはキャッシュが利用され、ビルドが高速になります。
-4.  **非rootユーザーでの実行**: コンテナのセキュリティにおける基本的なプラクティスです（最小権限の原則）。
+# .venv だけをコピー（ソースを同梱しない構成）
+COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
 
-```yml
-version: '3.8'
-
-services:
-  # Production service
-  app:
-    build:
-      context: .
-      target: production
-    # image: python-app:latest
-    container_name: python-app
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./src:/app/src:ro
-    environment:
-      - PYTHONUNBUFFERED=1
-    networks:
-      - app-network
-
-  # Test service
-  test:
-    build:
-      context: .
-      target: test
-    # image: python-app:test
-    container_name: python-app-test
-    volumes:
-      - ./src:/app/src:ro
-      - ./tests:/app/tests:ro
-    environment:
-      - PYTHONUNBUFFERED=1
-    command: uv run pytest tests/ -v
-    networks:
-      - app-network
-
-  # Development service for updating uv.lock
-  dev:
-    build:
-      context: .
-      target: dev
-    # image: python-app:dev
-    container_name: python-app-dev
-    volumes:
-      - ./pyproject.toml:/app/pyproject.toml
-      - ./uv.lock:/app/uv.lock
-      - ./src:/app/src
-      - ./tests:/app/tests
-    environment:
-      - PYTHONUNBUFFERED=1
-    command: /bin/bash
-    stdin_open: true
-    tty: true
-    networks:
-      - app-network
-
-networks:
-  app-network:
-    driver: bridge
+# エントリポイント
+ENV PATH="/app/.venv/bin:$PATH"
+# 例: my_app（コンソールスクリプト）を実行
+CMD ["my_app"]
 ```
 
-### `uv.lock` ファイルの作成
+* このパターンは「**non-editable + マルチステージ + .venv のみ移送**」で**起動速い・再現性高い・小さめ**な本番向け構成。依存とアプリをレイヤ分離し、cache mount でさらにビルドを速くできます。 ([Astral Docs][1])
+
+---
+
+### 参考 Dockerfile（開発・検証向け）
+
+```Dockerfile
+# uv を最初に導入してレイヤキャッシュを最大化
+FROM python:3.12-slim-bookworm
+
+COPY --from=ghcr.io/astral-sh/uv:0.8.7 /uv /uvx /bin/
+WORKDIR /app
+
+ENV UV_LINK_MODE=copy
+
+# 先に依存を固める（コードはまだ COPY しない）
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=/app/uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=/app/pyproject.toml \
+    uv sync --locked --no-install-project
+
+# ここで初めてソースをコピー
+ADD . /app
+
+# アプリを編集可能（デフォルト）で同期
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked
+
+# uv run で起動
+CMD ["uv", "run", "my_app"]
+```
+
+* この構成は**編集可（editable）**で、`docker compose watch` と合わせると快適な内製ループを作れます。`.venv` は**必ずイメージで作成したものを使い**、ホストの `.venv` はマウントしない／`.dockerignore` で除外してください。 ([Astral Docs][1])
+
+---
+
+### 付録：.dockerignore（例）
 
 ```
-docker compose run --rm dev uv lock
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.env
+dist/
+build/
 ```
 
-### テストの実行
+`.venv/` を除外するのが特に重要です。 ([Astral Docs][1])
 
-```
-docker compose run --rm test
-```
+---
 
-### アプリケーションの起動
+### さらに深掘り（参考）
 
-```
-docker compose up app -d
-```
+* **Docker 公式の Python ガイド**：一般的なコンテナ化の流れ・CI/CD・開発ループのヒント。 ([Docker Documentation][2])
+* **uv の最適 Dockerfile 例（Depot）**：`python:slim` ベースでの実践的な構成。 ([Depot][3])
+* **non-Alpine 推奨の背景**（manylinux/解決策とビルド体験の観点）：ベース選定の考え方に参考。 ([Python⇒Speed][4])
+
+---
+
+[1]: https://docs.astral.sh/uv/guides/integration/docker/ "Using uv in Docker | uv"
+[2]: https://docs.docker.com/guides/python/?utm_source=chatgpt.com "Python | Docker Docs"
+[3]: https://depot.dev/docs/container-builds/how-to-guides/optimal-dockerfiles/python-uv-dockerfile?utm_source=chatgpt.com "Best practice Dockerfile for Python with uv | Container Builds"
+[4]: https://pythonspeed.com/articles/official-docker-best-practices/?utm_source=chatgpt.com "Reviewing the official Dockerfile best practices: good, bad, insecure"
 
 ## 20. Infrastructure and Execution Environment
 **20. インフラストラクチャと実行環境**
